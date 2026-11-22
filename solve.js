@@ -41,6 +41,10 @@ export function run(input) {
   const n = text.length;
   let pos = 0; // the next character to read
   let line = 1; // the line that character is on
+  // Amortised cursors: the next '"' / CR at or after pos (-1: none left, -2: unknown).
+  // Each refresh scans forward from pos, so scanned regions never overlap.
+  let nq = -2;
+  let nr = -2;
   if (n > 0 && text.charCodeAt(0) === 0xfeff) pos = 1;
 
   // The record being read: the line it starts on and the index in rows it takes (null: the header).
@@ -105,7 +109,8 @@ export function run(input) {
     const openLine = line;
     // The closing quote: the next quote that is not doubled.
     let q = text.indexOf('"', pos + 1);
-    while (q !== -1 && text.charCodeAt(q + 1) === 34) q = text.indexOf('"', q + 2);
+    let hasDD = false;
+    while (q !== -1 && text.charCodeAt(q + 1) === 34) { hasDD = true; q = text.indexOf('"', q + 2); }
     if (q === -1) {
       // The quote never closes: it is a literal character, and the text after
       // it is read again as unquoted.
@@ -116,7 +121,7 @@ export function run(input) {
     }
     let value = text.slice(pos + 1, q);
     if (/["\r\n]/.test(value)) {
-      if (value.indexOf('"') !== -1) value = value.replaceAll('""', '"');
+      if (hasDD) value = value.replaceAll('""', '"');
       if (value.indexOf('\r') !== -1) value = value.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
       // Every line break inside quotes is one LF in the value now.
       let idx = -1;
@@ -174,22 +179,24 @@ export function run(input) {
     if (!hasNL) nl = n;
     let fields;
     let lastQuoted = false;
-    const qPos = text.indexOf('"', pos);
-    if (qPos === -1 || qPos >= nl) {
-      const seg = text.slice(pos, nl);
-      const cr = seg.indexOf('\r');
-      if (cr === -1) {
-        fields = seg.split(',');
-        pos = hasNL ? nl + 1 : n;
-        if (hasNL) line += 1;
-      } else if (hasNL && cr === seg.length - 1) {
-        fields = seg.slice(0, -1).split(',');
-        pos = nl + 1;
-        line += 1;
-      }
+    if (nq !== -1 && nq < pos) nq = text.indexOf('"', pos);
+    if (nr !== -1 && nr < pos) nr = text.indexOf('\r', pos);
+    const quoteFree = nq === -1 || nq >= nl;
+    const crFree = nr === -1 || nr >= nl;
+    if (quoteFree && crFree) {
+      fields = text.slice(pos, nl).split(',');
+      pos = hasNL ? nl + 1 : n;
+      if (hasNL) line += 1;
+    } else if (quoteFree && hasNL && nr === nl - 1) {
+      fields = text.slice(pos, nl - 1).split(',');
+      pos = nl + 1;
+      line += 1;
     }
     if (fields === undefined) {
       fields = [];
+      // The line this record starts on ends at nl (n + 1: no line break left).
+      // It stays valid until pos moves past it (a quoted field spanning lines).
+      let le = hasNL ? nl : n + 1;
       // Field by field; the unquoted read is inlined here (the hot path) so
       // it costs no call and no result object per field.
       for (;;) {
@@ -200,35 +207,42 @@ export function run(input) {
           if (f.ended !== COMMA) break;
         } else {
           lastQuoted = false;
+          if (pos > le) {
+            le = text.indexOf('\n', pos);
+            if (le === -1) le = n + 1;
+          }
           let cIdx = text.indexOf(',', pos);
           if (cIdx === -1) cIdx = n + 1;
-          let lIdx = text.indexOf('\n', pos);
-          if (lIdx === -1) lIdx = n + 1;
           let fieldEnd;
           let ended;
-          if (cIdx < lIdx) {
+          if (cIdx < le) {
             fieldEnd = cIdx;
             ended = COMMA;
-          } else if (lIdx <= n) {
-            fieldEnd = lIdx;
+          } else if (le <= n) {
+            fieldEnd = le;
             ended = LINE_BREAK;
           } else {
             fieldEnd = n;
             ended = END;
           }
-          let f = text.slice(pos, fieldEnd);
-          const crAt = f.indexOf('\r');
-          if (crAt !== -1) {
+          if (nr !== -1 && nr < pos) nr = text.indexOf('\r', pos);
+          let f;
+          if (nr === -1 || nr >= fieldEnd) {
+            f = text.slice(pos, fieldEnd);
+          } else if (ended === LINE_BREAK && nr === fieldEnd - 1) {
+            f = text.slice(pos, fieldEnd - 1);
+          } else {
+            const raw = text.slice(pos, fieldEnd);
             let out = '';
             let start = 0;
-            for (let i = 0; i < f.length; i++) {
-              if (f.charCodeAt(i) === 13) {
-                if (!(ended === LINE_BREAK && i === f.length - 1)) error('stray_cr');
-                out += f.slice(start, i);
+            for (let i = 0; i < raw.length; i++) {
+              if (raw.charCodeAt(i) === 13) {
+                if (!(ended === LINE_BREAK && i === raw.length - 1)) error('stray_cr');
+                out += raw.slice(start, i);
                 start = i + 1;
               }
             }
-            f = out + f.slice(start);
+            f = out + raw.slice(start);
           }
           fields.push(f);
           if (ended === COMMA) pos = fieldEnd + 1;
